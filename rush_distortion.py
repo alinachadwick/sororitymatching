@@ -474,57 +474,36 @@ def print_unbounded_case(inst, side, welfare_type, benchmark, profile):
           f"better matching = {float(inst.welfare_weights(other_matching, welfare_type) @ witness):.3f}")
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sororities", type=int, default=2)
-    ap.add_argument("--members", default="3", help="members per sorority (int or comma list)")
-    ap.add_argument("--rushees", type=int, default=2)
-    ap.add_argument("--spots", default="1", help="quota per sorority (int or comma list)")
-    ap.add_argument("--proposing", choices=["rushee", "sorority", "both"], default="both")
-    ap.add_argument("--agg", choices=list(AGGREGATORS), default="plurality")
-    ap.add_argument("--truncate", choices=["none", "unseen", "zero"], default="none",
-                    help="which rushees a sorority finds unacceptable after aggregation")
-    ap.add_argument("--search", choices=["sample", "exhaustive"], default="sample")
-    ap.add_argument("--samples", type=int, default=100)
-    ap.add_argument("--alpha", type=float, default=1.0, help="Dirichlet concentration for sampled utilities")
-    visibility = ap.add_mutually_exclusive_group()  # neither flag = every member meets every rushee
-    visibility.add_argument("--meet-prob", type=float, default=1.0,
-                            help="prob. a member meets a given rushee (independently)")
-    visibility.add_argument("--meet-count", type=int, default=None,
-                            help="every member meets exactly this many rushees, chosen at random")
-    ap.add_argument("--min-meet", type=int, default=1, help="with --meet-prob: minimum rushees a member meets")
-    ap.add_argument("--floor", type=float, default=0.0, help="utility floor (unit-sum); 0 allows zeros")
-    ap.add_argument("--no-lp", action="store_true", help="skip distortion LPs (realized welfare only)")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--verbose", action="store_true", help="print worst-case profile per cell")
-    args = ap.parse_args()
+def mean(xs):
+    return sum(xs) / len(xs) if xs else float("nan")
 
-    n_sor, n_rushees = args.sororities, args.rushees
-    members_per_sor = broadcast(args.members, n_sor, "members")
-    quota = broadcast(args.spots, n_sor, "spots")
-    sides = ["rushee", "sorority"] if args.proposing == "both" else [args.proposing]
-    inst = Instance(n_sor, members_per_sor, quota, n_rushees, args.floor)
-    if args.meet_count is not None and not 1 <= args.meet_count <= n_rushees:
-        sys.exit(f"--meet-count must be between 1 and the number of rushees ({n_rushees})")
-    partial_visibility = args.meet_prob < 1 or (args.meet_count is not None and args.meet_count < n_rushees)
-    if args.search == "exhaustive" and partial_visibility:
-        sys.exit("exhaustive search supports full visibility only (use --search sample)")
-    if args.search == "exhaustive" and args.no_lp:
-        sys.exit("exhaustive search needs the LPs")
 
-    rng = np.random.default_rng(args.seed)
+def summarize(values):
+    """'mean±sd' of the finite values (one per seed), plus how many seeds were infinite."""
+    finite = [v for v in values if v != INF]
+    n_inf = len(values) - len(finite)
+    if not finite:
+        return "inf"
+    text = f"{np.mean(finite):.3f}"
+    if len(finite) > 1:
+        text += f"±{np.std(finite, ddof=1):.3f}"
+    if n_inf:
+        text += f" ({n_inf}/{len(values)} inf)"
+    return text
+
+
+def run_seed(inst, args, sides, cells, seed):
+    """Evaluate every profile for one seed. Returns counts plus the per-cell results."""
+    rng = np.random.default_rng(seed)
     if args.search == "exhaustive":
         profiles = exhaustive_profiles(inst)
     else:
-        profiles = (sample_profile(rng, inst, args.alpha, args.meet_prob, args.min_meet,
-                                       args.meet_count)
+        profiles = (sample_profile(rng, inst, args.alpha, args.meet_prob, args.min_meet, args.meet_count)
                     for _ in range(args.samples))
 
-    cells = [(side, welfare_type) for side in sides for welfare_type in WELFARE_TYPES]
     realized = {c: {"welfare": [], "real_all": [], "real_stable": []} for c in cells}  # per-profile values
     worst = {c: {} for c in cells}  # worst[cell]["lp_all" / "lp_stable"] = (distortion, profile that attains it)
     n_profiles = n_multi_stable = n_differ = 0
-    t0 = time.time()
     for member_rankings, rushee_rankings, utils in profiles:
         n_profiles += 1
         res = evaluate(inst, member_rankings, rushee_rankings, utils, sides, args.agg, args.truncate,
@@ -541,12 +520,14 @@ def main():
                                                      lists=res["lists"], outcome=res["outcome"][cell[0]],
                                                      stable=res["stable"],
                                                      witness=res[cell]["witness_" + name[len("lp_"):]]))
+    return dict(n_profiles=n_profiles, n_multi_stable=n_multi_stable, n_differ=n_differ,
+                realized=realized, worst=worst)
 
-    print("=" * 92)
-    print(f"S={n_sor} sororities  members={members_per_sor}  rushees={n_rushees}  spots={quota}  "
-          f"agg={args.agg}  truncate={args.truncate}  floor={args.floor}  "
-          + (f"meet_count={args.meet_count}" if args.meet_count is not None else f"meet_prob={args.meet_prob}"))
-    print(f"{args.search}: {n_profiles} profiles in {time.time() - t0:.1f}s | >1 stable matching: {n_multi_stable}"
+
+def report_single_seed(args, inst, sides, cells, run, elapsed):
+    n_profiles, n_multi_stable, n_differ = run["n_profiles"], run["n_multi_stable"], run["n_differ"]
+    realized, worst = run["realized"], run["worst"]
+    print(f"{args.search}: {n_profiles} profiles in {elapsed:.1f}s | >1 stable matching: {n_multi_stable}"
           + (f" | rushee-DA != sorority-DA: {n_differ}" if len(sides) == 2 else ""))
     print("-" * 92)
     has_utils = args.search == "sample"
@@ -560,7 +541,6 @@ def main():
         line = f"{side:<9} {welfare_type:<6}"
         if has_utils:
             vals = realized[(side, welfare_type)]
-            mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
             line += (f" {mean(vals['welfare']):8.3f} {fmt(mean(vals['real_all'])):>16}"
                      f" {fmt(mean(vals['real_stable'])):>17}")
         if not args.no_lp:
@@ -584,6 +564,98 @@ def main():
             print(f"  aggregated sorority lists: {profile['lists']}")
             print(f"  outcome (rushee -> sorority, -1 = unmatched): {profile['outcome']}")
             print(f"  stable matchings: {profile['stable']}")
+
+
+def report_multi_seed(args, sides, cells, seeds, runs, elapsed):
+    multi = [r["n_multi_stable"] for r in runs]
+    differ = [r["n_differ"] for r in runs]
+    print(f"sample: {len(seeds)} seeds ({seeds[0]}..{seeds[-1]}) x {args.samples} profiles in {elapsed:.1f}s")
+    print(f"per seed, profiles with >1 stable matching: mean {np.mean(multi):.1f} (min {min(multi)}, max {max(multi)})"
+          + (f" | rushee-DA != sorority-DA: mean {np.mean(differ):.1f}" if len(sides) == 2 else ""))
+    print("-" * 92)
+    header = ["proposing", "welfare", "mean W", "mean ratio(all)", "mean ratio(stab)"]
+    if not args.no_lp:
+        header += ["max LP dist(all)", "max LP dist(stab)", "worst seed (all)", "worst seed (stab)"]
+    rows = [header]
+    for cell in cells:
+        def per_seed(name):
+            return [mean(r["realized"][cell][name]) for r in runs]
+        row = [cell[0], cell[1], summarize(per_seed("welfare")),
+               summarize(per_seed("real_all")), summarize(per_seed("real_stable"))]
+        if not args.no_lp:
+            lp_all = [r["worst"][cell]["lp_all"][0] for r in runs]
+            lp_stable = [r["worst"][cell]["lp_stable"][0] for r in runs]
+            row += [summarize(lp_all), summarize(lp_stable), fmt(max(lp_all)), fmt(max(lp_stable))]
+        rows.append(row)
+    widths = [max(len(row[c]) for row in rows) for c in range(len(header))]
+    for row in rows:
+        print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip())
+    print("-" * 92)
+    print("Each entry is mean±sd across seeds of that seed's statistic (the LP columns use each seed's max\n"
+          "over its profiles); '(k/N inf)' = k seeds were infinite and are left out of the mean.\n"
+          "'worst seed' = the largest value over all seeds. --verbose / unbounded-case details need --num-seeds 1.")
+
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--sororities", type=int, default=2)
+    ap.add_argument("--members", default="3", help="members per sorority (int or comma list)")
+    ap.add_argument("--rushees", type=int, default=2)
+    ap.add_argument("--spots", default="1", help="quota per sorority (int or comma list)")
+    ap.add_argument("--proposing", choices=["rushee", "sorority", "both"], default="both")
+    ap.add_argument("--agg", choices=list(AGGREGATORS), default="plurality")
+    ap.add_argument("--truncate", choices=["none", "unseen", "zero"], default="none",
+                    help="which rushees a sorority finds unacceptable after aggregation")
+    ap.add_argument("--search", choices=["sample", "exhaustive"], default="sample")
+    ap.add_argument("--samples", type=int, default=100)
+    ap.add_argument("--alpha", type=float, default=1.0, help="Dirichlet concentration for sampled utilities")
+    visibility = ap.add_mutually_exclusive_group()  # neither flag = every member meets every rushee
+    visibility.add_argument("--meet-prob", type=float, default=1.0,
+                            help="prob. a member meets a given rushee (independently)")
+    visibility.add_argument("--meet-count", type=int, default=None,
+                            help="every member meets exactly this many rushees, chosen at random")
+    ap.add_argument("--min-meet", type=int, default=1, help="with --meet-prob: minimum rushees a member meets")
+    ap.add_argument("--floor", type=float, default=0.0, help="utility floor (unit-sum); 0 allows zeros")
+    ap.add_argument("--no-lp", action="store_true", help="skip distortion LPs (realized welfare only)")
+    ap.add_argument("--seed", type=int, default=0, help="first random seed")
+    ap.add_argument("--num-seeds", type=int, default=1,
+                    help="run seeds --seed .. --seed+N-1 and report mean/sd across seeds (sample mode)")
+    ap.add_argument("--verbose", action="store_true", help="print worst-case profile per cell")
+    args = ap.parse_args()
+
+    n_sor, n_rushees = args.sororities, args.rushees
+    members_per_sor = broadcast(args.members, n_sor, "members")
+    quota = broadcast(args.spots, n_sor, "spots")
+    sides = ["rushee", "sorority"] if args.proposing == "both" else [args.proposing]
+    inst = Instance(n_sor, members_per_sor, quota, n_rushees, args.floor)
+    if args.meet_count is not None and not 1 <= args.meet_count <= n_rushees:
+        sys.exit(f"--meet-count must be between 1 and the number of rushees ({n_rushees})")
+    partial_visibility = args.meet_prob < 1 or (args.meet_count is not None and args.meet_count < n_rushees)
+    if args.search == "exhaustive" and partial_visibility:
+        sys.exit("exhaustive search supports full visibility only (use --search sample)")
+    if args.search == "exhaustive" and args.no_lp:
+        sys.exit("exhaustive search needs the LPs")
+
+    if args.num_seeds < 1:
+        sys.exit("--num-seeds must be at least 1")
+    if args.search == "exhaustive" and args.num_seeds > 1:
+        sys.exit("exhaustive search does not depend on the seed (use --search sample with --num-seeds)")
+
+    cells = [(side, welfare_type) for side in sides for welfare_type in WELFARE_TYPES]
+    seeds = [args.seed + i for i in range(args.num_seeds)]
+    t0 = time.time()
+    runs = [run_seed(inst, args, sides, cells, seed) for seed in seeds]
+    elapsed = time.time() - t0
+
+    print("=" * 92)
+    print(f"S={n_sor} sororities  members={members_per_sor}  rushees={n_rushees}  spots={quota}  "
+          f"agg={args.agg}  truncate={args.truncate}  floor={args.floor}  "
+          + (f"meet_count={args.meet_count}" if args.meet_count is not None else f"meet_prob={args.meet_prob}"))
+    if len(seeds) == 1:
+        report_single_seed(args, inst, sides, cells, runs[0], elapsed)
+    else:
+        report_multi_seed(args, sides, cells, seeds, runs, elapsed)
 
 
 if __name__ == "__main__":
